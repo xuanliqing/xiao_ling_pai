@@ -1,0 +1,294 @@
+{% raw %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiteOS 多设备监控中心</title>
+    <link href="https://cdn.staticfile.org/twitter-bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; padding-top: 20px; }
+        .card { box-shadow: 0 4px 8px rgba(0,0,0,0.1); border: none; margin-bottom: 20px;}
+        .sensor-val { font-size: 2.5rem; font-weight: bold; color: #0d6efd; }
+        .sensor-unit { font-size: 1rem; color: #6c757d; }
+        #chart-container { width: 100%; height: 400px; }
+        .bulb-icon { font-size: 3rem; color: #ccc; transition: color 0.3s;}
+        .bulb-on { color: #ffc107; }
+        .chart-controls { background: #fff; padding: 10px; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: center; gap: 15px;}
+        .device-selector { background: #e9ecef; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div id="app" class="container">
+        <h2 class="text-center mb-4">LiteOS 多设备监控大屏</h2>
+
+        <div class="device-selector d-flex align-items-center justify-content-center gap-3">
+            <label class="fw-bold">👉 选择要监控的设备:</label>
+            <select class="form-select w-auto" v-model="currentDeviceId" @change="handleDeviceChange">
+                <option v-for="(data, devId) in devices" :value="devId" :key="devId">
+                    {{ devId }} ({{ data.light_on ? '灯亮' : '灯灭' }})
+                </option>
+            </select>
+            <span v-if="Object.keys(devices).length === 0" class="text-danger">
+                暂无设备在线 (请检查开发板是否已连接 WiFi 并发送数据)
+            </span>
+        </div>
+
+        <div v-if="currentDeviceId && devices[currentDeviceId]" class="row">
+            <div class="col-md-4">
+                <div class="card text-center p-3">
+                    <h5>实时温度</h5>
+                    <div>
+                        <span class="sensor-val">{{ devices[currentDeviceId].temperature.toFixed(1) }}</span>
+                        <span class="sensor-unit">℃</span>
+                    </div>
+                </div>
+                <div class="card text-center p-3">
+                    <h5>实时湿度</h5>
+                    <div>
+                        <span class="sensor-val">{{ devices[currentDeviceId].humidity.toFixed(1) }}</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                </div>
+                <div class="card text-center p-3">
+                    <h5>设备控制 ({{ currentDeviceId }})</h5>
+                    <div class="mb-3">
+                        <i class="bulb-icon" :class="{ 'bulb-on': devices[currentDeviceId].light_on }">💡</i>
+                    </div>
+                    <button class="btn btn-lg w-100" 
+                        :class="devices[currentDeviceId].light_on ? 'btn-danger' : 'btn-success'" 
+                        @click="toggleLight" :disabled="isLoading">
+                        {{ devices[currentDeviceId].light_on ? '关闭灯光' : '开启灯光' }}
+                    </button>
+                </div>
+            </div>
+
+            <div class="col-md-8">
+                <div class="card p-3">
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h5 class="m-0">数据趋势 ({{ currentDeviceId }})</h5>
+                    </div>
+
+                    <div class="chart-controls border">
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="radio" id="modeRealtime" value="realtime" v-model="viewMode" @change="handleModeChange">
+                            <label class="form-check-label" for="modeRealtime">实时监控</label>
+                        </div>
+                        <div class="form-check form-check-inline">
+                            <input class="form-check-input" type="radio" id="modeHistory" value="history" v-model="viewMode" @change="handleModeChange">
+                            <label class="form-check-label" for="modeHistory">历史回放</label>
+                        </div>
+                        
+                        <div v-if="viewMode === 'history'" class="d-flex gap-2">
+                            <input type="date" class="form-control form-control-sm" v-model="selectedDate">
+                            <button class="btn btn-sm btn-primary" @click="fetchHistoryData">查询</button>
+                        </div>
+                    </div>
+
+                    <div id="chart-container"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/vue.js"></script>
+    <script src="/static/js/axios.js"></script>
+    <script src="/static/js/echarts.js"></script>
+
+    <script>
+        const { createApp } = Vue;
+
+        createApp({
+            data() {
+                return {
+                    devices: {},
+                    currentDeviceId: "",
+                    isLoading: false,
+                    chartInstance: null,
+                    chartDataTime: [],
+                    chartDataTemp: [],
+                    timer: null,
+                    viewMode: 'realtime',
+                    selectedDate: new Date().toISOString().split('T')[0]
+                }
+            },
+            mounted() {
+                // 删除这里的 this.initChart(); 因为此时 DOM 可能还没准备好
+                this.startPolling();
+                
+                // 窗口大小改变时自动调整图表大小
+                window.addEventListener('resize', () => {
+                    if (this.chartInstance) {
+                        this.chartInstance.resize();
+                    }
+                });
+            },
+            // --- 【核心修复】新增 watch 监听 ---
+            watch: {
+                // 监听当前选中的设备ID
+                currentDeviceId(newVal) {
+                    // 如果有了设备ID，且图表还没初始化
+                    if (newVal && !this.chartInstance) {
+                        // $nextTick 的意思是：等 Vue 把界面画好之后，再执行里面的代码
+                        this.$nextTick(() => {
+                            this.initChart();
+                        });
+                    }
+                }
+            },
+            // -------------------------------
+            methods: {
+                initChart() {
+                    const chartDom = document.getElementById('chart-container');
+                    // 如果还找不到 DOM，说明时机不对，直接返回
+                    if(!chartDom) return;
+                    
+                    // 销毁旧实例（如果有），防止内存泄漏
+                    if(this.chartInstance != null && this.chartInstance != "" && this.chartInstance != undefined) {
+                        this.chartInstance.dispose();
+                    }
+
+                    this.chartInstance = echarts.init(chartDom);
+                    const option = {
+                        title: { text: '数据加载中...', left: 'center' },
+                        tooltip: { trigger: 'axis' },
+                        grid: { left: '3%', right: '8%', bottom: '3%', containLabel: true },
+                        xAxis: { type: 'category', data: [] },
+                        yAxis: { type: 'value', name: '温度(℃)', scale: true },
+                        series: [{
+                            data: [],
+                            type: 'line', 
+                            smooth: true,
+                            itemStyle: { color: '#0d6efd' },
+                            areaStyle: { color: 'rgba(13, 110, 253, 0.1)' }
+                        }]
+                    };
+                    this.chartInstance.setOption(option);
+                },
+
+                startPolling() {
+                    this.fetchDevices();
+                    this.timer = setInterval(this.fetchDevices, 1000);
+                },
+
+                fetchDevices() {
+                    axios.get('/api/devices').then(res => {
+                        this.devices = res.data;
+                        const ids = Object.keys(this.devices);
+                        
+                        if (!this.currentDeviceId && ids.length > 0) {
+                            this.currentDeviceId = ids[0];
+                            this.chartDataTime = [];
+                            this.chartDataTemp = [];
+                            // 这里改变 currentDeviceId 会触发上面的 watch -> initChart
+                        }
+
+                        if (this.currentDeviceId && this.viewMode === 'realtime') {
+                            this.updateRealtimeChart();
+                        }
+                    }).catch(err => console.error("API请求失败:", err));
+                },
+
+                updateRealtimeChart() {
+                    // 【安全检查】如果图表还没初始化成功，就不要更新，防止报错
+                    if (!this.chartInstance) return;
+
+                    const currentData = this.devices[this.currentDeviceId];
+                    if (!currentData) return;
+
+                    const now = new Date().toLocaleTimeString();
+                    if (this.chartDataTime.length > 0 && this.chartDataTime[this.chartDataTime.length - 1] === now) {
+                        return; 
+                    }
+
+                    this.chartDataTime.push(now);
+                    this.chartDataTemp.push(currentData.temperature);
+
+                    if (this.chartDataTime.length > 60) {
+                        this.chartDataTime.shift();
+                        this.chartDataTemp.shift();
+                    }
+                    
+                    this.chartInstance.setOption({
+                        title: { text: this.currentDeviceId + ' 实时监控' },
+                        xAxis: { data: this.chartDataTime },
+                        series: [{ data: this.chartDataTemp }]
+                    });
+                },
+
+                handleDeviceChange() {
+                    this.chartDataTime = [];
+                    this.chartDataTemp = [];
+                    this.viewMode = 'realtime';
+                    if (this.chartInstance) {
+                        this.chartInstance.setOption({
+                            title: { text: '切换设备中...' },
+                            xAxis: { data: [] }, series: [{ data: [] }] 
+                        });
+                    }
+                },
+
+                fetchHistoryData() {
+                    if (!this.currentDeviceId || !this.chartInstance) return;
+                    
+                    this.chartInstance.showLoading();
+                    axios.get('/api/history', { 
+                        params: { 
+                            date: this.selectedDate,
+                            device_id: this.currentDeviceId 
+                        } 
+                    })
+                    .then(res => {
+                        this.chartInstance.hideLoading();
+                        const times = res.data.times;
+                        const temps = res.data.temps;
+                        
+                        if (!times || times.length === 0) {
+                            alert("该设备在 " + this.selectedDate + " 没有历史数据");
+                            return;
+                        }
+                        this.chartInstance.setOption({
+                            title: { text: `${this.currentDeviceId} - ${this.selectedDate} 历史回放` },
+                            xAxis: { data: times },
+                            series: [{ data: temps }]
+                        });
+                    }).catch(err => {
+                        this.chartInstance.hideLoading();
+                        console.error(err);
+                        alert("查询失败，请检查后端日志");
+                    });
+                },
+
+                handleModeChange() {
+                    if (this.viewMode === 'realtime') {
+                        this.chartDataTime = [];
+                        this.chartDataTemp = [];
+                    }
+                },
+
+                toggleLight() {
+                    if (!this.currentDeviceId) return;
+                    this.isLoading = true;
+                    
+                    const currentStatus = this.devices[this.currentDeviceId].light_on;
+                    const targetAction = currentStatus ? 'off' : 'on';
+                    
+                    axios.post('/api/control', { 
+                        device_id: this.currentDeviceId, 
+                        action: targetAction 
+                    })
+                    .then(res => {
+                        console.log("控制指令已发送");
+                    })
+                    .catch(err => {
+                        alert("控制失败: " + err);
+                    })
+                    .finally(() => {
+                        setTimeout(() => this.isLoading = false, 500);
+                    });
+                }
+            }
+        }).mount('#app');
+    </script>
+</html>
+{% endraw %}
